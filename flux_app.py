@@ -4,6 +4,7 @@ import numpy as np
 import flux_backend as backend
 import base64
 import os
+import re
 
 # ============================================================
 # 1. CONFIGURACIÓN VISUAL
@@ -117,7 +118,7 @@ if uploaded_file is None:
 file_bytes = uploaded_file.getvalue()
 try:
     df_raw_load = backend.load_csv(file_bytes)
-    df_raw_load.columns = [str(c).strip() for c in df_raw_load.columns]
+    df_raw_load.columns = [re.sub(r'[^a-zA-Z0-9_]', '', str(c).strip()) for c in df_raw_load.columns]
 except Exception as e:
     st.error(f"Error leyendo archivo: {e}")
     st.stop()
@@ -372,26 +373,61 @@ with tab4:
     total_org_cli_12 = matriz_org_clientes[:, 11].sum()
     monthly_org_impact = total_org_anual / 12
 
-    # --- INCREMENTALES ---
-    curva_retencion_base = [1.0, 0.141, 0.149, 0.149, 0.155, 0.165, 0.154, 0.172, 0.168, 0.170, 0.172, 0.185]
+# ==============================================================================
+    # MOTOR DE SIMULACIÓN (CONECTADO A DATA REAL)
+    # ==============================================================================
+    
+    # 1. Extraemos la retención real del gráfico (backend)
+    try:
+        curva_retencion_real = (ret_table.sort_values("mes_vida")["retencion_%"] / 100).tolist()
+    except Exception:
+        # Fallback si falla la tabla
+        curva_retencion_real = [1.0, 0.60, 0.55, 0.50, 0.45, 0.40, 0.40, 0.40, 0.38, 0.38, 0.38, 0.38]
+
+    # Aseguramos los 12 meses
+    while len(curva_retencion_real) < meses_proyeccion:
+        curva_retencion_real.append(curva_retencion_real[-1] if curva_retencion_real else 0.40)
+
+    # 2. CÁLCULO DE INCREMENTALES (COHORTES)
     matriz_inc_impacto = np.zeros((meses_proyeccion, meses_proyeccion))
     matriz_inc_clientes = np.zeros((meses_proyeccion, meses_proyeccion))
+    
     for i in range(meses_proyeccion):
         for mes_vida in range(meses_proyeccion):
             idx_calendario = i + mes_vida
             if idx_calendario < meses_proyeccion:
-                idx_ret = mes_vida if mes_vida < len(curva_retencion_base) else -1
-                tasa_ret_base = curva_retencion_base[idx_ret]
+                tasa_ret_base = curva_retencion_real[mes_vida]
                 if mes_vida == 0:
                     clientes_inc = val_m
                 else:
                     tasa_ret_nueva = tasa_ret_base + delta_retencion
                     clientes_inc = np.round(val_m * tasa_ret_nueva)
+                
                 matriz_inc_impacto[i, idx_calendario] = clientes_inc * val_a
                 matriz_inc_clientes[i, idx_calendario] = clientes_inc
+
     total_inc_anual = matriz_inc_impacto.sum()
-    total_foco_act = val_m * 12
     monthly_inc_impact = total_inc_anual / 12
+    total_foco_act = val_m * 12
+
+    # 3. CÁLCULO DE RESURRECCIÓN (NUEVA LÓGICA CON DATA REAL)
+    # Definimos las variables que te daban error
+    clientes_resucitados_mes = np.round(val_n * eff_resurreccion)
+    acumulado_clientes_res = clientes_resucitados_mes * 12
+    
+    # El dinero de resurrección considera el valor histórico descontado
+    # y se comporta como una cohorte que ya está en su etapa de madurez (mes 12)
+    tasa_ret_res = curva_retencion_real[11] + delta_retencion
+    ingreso_res_mensual = (clientes_resucitados_mes * val_a) * (1 - tasa_descuento_res)
+    
+    # Proyectamos el flujo de resurrección a 12 meses para obtener el impacto mensual
+    matriz_res_impacto = np.zeros((meses_proyeccion, meses_proyeccion))
+    for i in range(meses_proyeccion):
+        for j in range(i, meses_proyeccion):
+            matriz_res_impacto[i, j] = ingreso_res_mensual
+            
+    monthly_res_impact = matriz_res_impacto.sum() / 12
+    acumulado_dinero_res = matriz_res_impacto.sum() # Para el KPI anual
 
     # --- RESURRECCIÓN ---
     # Dinero
