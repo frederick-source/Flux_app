@@ -55,25 +55,24 @@ def fmt_money(x): return "N/A" if pd.isna(x) else f"${x:,.0f}"
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_csv(file_bytes: bytes) -> pd.DataFrame:
-    import io
-    # Leemos una muestra para detectar el separador real
-    sample = file_bytes[:10000].decode('utf-8', errors='ignore')
-    
-    # Contamos cuál aparece más: coma o punto y coma
-    count_commas = sample.count(',')
-    count_semicolons = sample.count(';')
-    
-    # Si hay una coma accidental en el header pero el resto es punto y coma, 
-    # ganará el punto y coma por mayoría.
-    detected_sep = ';' if count_semicolons > count_commas else ','
-    
+    """
+    Intenta leer el CSV probando separadores comunes (',' y ';')
+    y codificaciones (utf-8, latin1).
+    """
     try:
-        # Intentamos con la detección inteligente
-        df = pd.read_csv(io.BytesIO(file_bytes), sep=detected_sep, low_memory=False)
+        # Intento 1: Separador estándar (,) y utf-8
+        df = pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=",", low_memory=False)
+        if len(df.columns) < 2:
+            raise ValueError("Posible error de separador")
         return df
-    except Exception:
-        # Fallback por si lo anterior falla (para encodings raros)
-        return pd.read_csv(io.BytesIO(file_bytes), sep=None, engine='python', encoding='latin1')
+    except:
+        try:
+            # Intento 2: Separador punto y coma (;)
+            df = pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=";", low_memory=False)
+            return df
+        except:
+            # Intento 3: Codificación latin1 (común en Excel viejos)
+            return pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=None, engine='python', encoding='latin1')
 
 def clean_input_data(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: str) -> pd.DataFrame:
     """
