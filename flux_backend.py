@@ -51,67 +51,55 @@ def fmt_int(x): return "N/A" if pd.isna(x) else f"{x:,.0f}"
 def fmt_money(x): return "N/A" if pd.isna(x) else f"${x:,.0f}"
 
 # ============================================================
-# 2. Carga y Limpieza (NUEVAS FUNCIONES)
+# 2. Carga y Limpieza
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_csv(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Intenta leer el CSV probando separadores comunes (',' y ';')
-    y codificaciones (utf-8, latin1).
-    """
+    import io
+    sample = file_bytes[:10000].decode('utf-8', errors='ignore')
+    count_commas = sample.count(',')
+    count_semicolons = sample.count(';')
+    detected_sep = ';' if count_semicolons > count_commas else ','
+    
     try:
-        # Intento 1: Separador estándar (,) y utf-8
-        df = pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=",", low_memory=False)
-        if len(df.columns) < 2:
-            raise ValueError("Posible error de separador")
+        df = pd.read_csv(io.BytesIO(file_bytes), sep=detected_sep, low_memory=False)
         return df
-    except:
-        try:
-            # Intento 2: Separador punto y coma (;)
-            df = pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=";", low_memory=False)
-            return df
-        except:
-            # Intento 3: Codificación latin1 (común en Excel viejos)
-            return pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=None, engine='python', encoding='latin1')
+    except Exception:
+        return pd.read_csv(io.BytesIO(file_bytes), sep=None, engine='python', encoding='latin1')
 
 def clean_input_data(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: str) -> pd.DataFrame:
-    """
-    Deja solo las 3 columnas necesarias y limpia los datos sucios
-    (IDs con nombres, fechas raras, montos con puntos/comas).
-    """
-    # 1. Seleccionar solo lo necesario y renombrar para estandarizar
     clean = df[[col_fecha, col_id, col_monto]].copy()
     clean.columns = ["fecha", "id", "monto"]
 
-    # 2. LIMPIEZA DE ID (Crítica para "ID Nombre")
     clean["id"] = clean["id"].astype(str).str.strip()
-    # Cortar en el primer espacio (ej: "12345 Juan" -> "12345")
     clean["id"] = clean["id"].str.split(pat=" ", n=1).str[0]
-    # Eliminar caracteres raros (dejar solo letras, números, guiones y puntos)
     clean["id"] = clean["id"].str.replace(r"[^a-zA-Z0-9\-\.]", "", regex=True)
 
-    # 3. LIMPIEZA DE MONTO
     clean["monto"] = parse_amount_series(clean["monto"])
-
-    # 4. LIMPIEZA DE FECHA (dayfirst ayuda con formato Latam DD/MM/YYYY)
-    clean["fecha"] = pd.to_datetime(clean["fecha"], dayfirst=True, errors="coerce")
-
-    # 5. ELIMINAR FILAS BASURA (Sin fecha o sin monto)
-    clean = clean.dropna(subset=["fecha", "monto"])
     
+    # --- CORRECCIÓN AQUÍ: Lectura de fechas más flexible ---
+    # Eliminamos dayfirst=True forzado para permitir formatos YYYY-M-D (como el de tu archivo)
+    # Primero intentamos la detección estándar (funciona mejor con YYYY-MM-DD)
+    clean["fecha"] = pd.to_datetime(clean["fecha"], errors="coerce")
+    
+    # Si la detección falló (muchos NaT), intentamos forzando día primero (para casos DD/MM/YYYY)
+    if clean["fecha"].isna().sum() > len(clean) * 0.5:
+        clean["fecha"] = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
+    
+    # Eliminamos solo lo que realmente no se pudo leer
+    clean = clean.dropna(subset=["fecha", "monto"])
+
     return clean
 
 # ============================================================
-# 3. Cálculo de Cohortes (CON FRECUENCIA)
+# 3. Cálculo de Cohortes
 # ============================================================
 @st.cache_data(show_spinner=False)
 def compute_historico(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: str,
-                      outlier_pct: float, months_to_exclude: int):
-    # Nota: df ya viene limpio de clean_input_data, pero renombramos por seguridad
-    # para mantener compatibilidad con los nombres de argumentos.
+                     outlier_pct: float, months_to_exclude: int):
     raw = df.rename(columns={col_fecha: "fecha", col_id: "id", col_monto: "monto"}).copy()
-    
-    # Aseguramos tipos (redundante si viene de clean_input_data, pero seguro)
+
+    # Aquí también aseguramos una lectura limpia sin forzar parámetros extraños
     raw["fecha"] = pd.to_datetime(raw["fecha"], errors="coerce")
     raw["id"] = raw["id"].astype(str)
     raw["monto"] = parse_amount_series(raw["monto"])
@@ -119,16 +107,13 @@ def compute_historico(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: 
     raw = raw.dropna(subset=["fecha", "id", "monto"]).copy()
     raw = raw[raw["monto"] > 0].copy()
 
-    # --- AGREGACIÓN POR DÍA (Para Frecuencia Correcta) ---
-    # Fusionamos compras del mismo día en una sola transacción
     raw = (raw.groupby(["id", "fecha"], as_index=False)
-              .agg(monto=("monto", "sum")))
+           .agg(monto=("monto", "sum")))
 
     raw["periodo_tx"] = raw["fecha"].dt.to_period("M")
     fecha_max = raw["fecha"].max()
     periodo_max = fecha_max.to_period("M")
 
-    # Cohorte
     first_pos = raw.groupby("id")["fecha"].min()
     cohort_df = first_pos.to_frame(name="fecha_cohorte")
     cohort_df["periodo_cohorte"] = cohort_df["fecha_cohorte"].dt.to_period("M")
@@ -136,42 +121,37 @@ def compute_historico(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: 
 
     raw = raw[raw["id"].isin(cohort_df.index)].copy()
 
-    # Outliers
     tx_pos = raw["monto"]
     limite_outlier = float(tx_pos.quantile(1.0 - outlier_pct)) if len(tx_pos) else np.nan
     raw["es_outlier_tx"] = raw["monto"] >= limite_outlier if pd.notna(limite_outlier) else False
     outlier_customers = set(raw.loc[raw["es_outlier_tx"], "id"].unique())
 
-    # Cliente-Mes
     raw = raw.join(cohort_df[["periodo_cohorte"]], on="id")
     cm = (raw.groupby(["id", "periodo_tx", "periodo_cohorte"], as_index=False)
-            .agg(
-                monto_neto_cliente_mes=("monto", "sum"),
-                tx_count=("monto", "count"), 
-                has_outlier_mes=("es_outlier_tx", "any")
-            ))
+          .agg(
+              monto_neto_cliente_mes=("monto", "sum"),
+              tx_count=("monto", "count"),
+              has_outlier_mes=("es_outlier_tx", "any")
+          ))
 
     cm["mes_vida"] = cm.apply(lambda r: months_diff(r["periodo_tx"], r["periodo_cohorte"]), axis=1)
     cm = cm[cm["mes_vida"] >= 0].copy()
     cm["activo_mes"] = cm["monto_neto_cliente_mes"] > 0
     cm_arpu = cm[~cm["has_outlier_mes"]].copy()
 
-    # Segmentos (Estricto 0-11 y 12-36)
     ids_nuevos = cohort_df[cohort_df["edad_actual_meses"].between(0, 11)].index
     ids_recurrentes = cohort_df[cohort_df["edad_actual_meses"].between(12, 36)].index
 
-    # Frecuencia
     mask_new = (cm["id"].isin(ids_nuevos)) & (cm["mes_vida"].between(0, 11)) & (cm["activo_mes"])
     freq_new = cm.loc[mask_new, "tx_count"].mean() if mask_new.any() else 0.0
 
     mask_rec = (cm["id"].isin(ids_recurrentes)) & (cm["mes_vida"].between(12, 36)) & (cm["activo_mes"])
     freq_rec = cm.loc[mask_rec, "tx_count"].mean() if mask_rec.any() else 0.0
 
-    # KPIs Globales
     win = pd.period_range(end=periodo_max, periods=36, freq="M")
     new_entries_all = cohort_df.groupby("periodo_cohorte").size().sort_index()
     s_new = new_entries_all.reindex(win)
-    
+
     observed_months_sorted = new_entries_all.index.sort_values()
     if months_to_exclude > 0:
         months_to_drop = observed_months_sorted[:months_to_exclude]
@@ -180,21 +160,22 @@ def compute_historico(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: 
 
     avg_new_entries = (s_new.sum() / s_new.notna().sum()) if s_new.notna().sum() > 0 else np.nan
 
-    rec_active_by_month = (cm[(cm["mes_vida"].between(12, 36)) & (cm["activo_mes"])]
-                           .groupby("periodo_tx")["id"].nunique().reindex(win))
-    avg_rec_active = (rec_active_by_month.sum() / rec_active_by_month.notna().sum()) if rec_active_by_month.notna().sum() > 0 else np.nan
+    ventana_inicio = periodo_max - 5
+    mask_active_window = (cm["activo_mes"]) & (cm["periodo_tx"] >= ventana_inicio) & (cm["periodo_tx"] <= periodo_max)
+    ids_activos_recientes = cm.loc[mask_active_window, "id"].unique()
+    ids_recurrentes_activos = np.intersect1d(ids_activos_recientes, ids_recurrentes)
+    avg_rec_active = len(ids_recurrentes_activos)
 
-    # Retención
     cohort_sizes = cohort_df.groupby("periodo_cohorte").size()
     rows_ret = []
-    for k in range(0, 13): 
+    for k in range(0, 13):
         eligible_coh = cohort_sizes.index[(cohort_sizes.index + k) <= periodo_max]
         eligible = float(cohort_sizes.loc[eligible_coh].sum()) if len(eligible_coh) else 0.0
         observed = float(cm[(cm["mes_vida"] == k) & (cm["activo_mes"])]["id"].nunique())
-        
+
         if k == 0: ret = 1.0
         else: ret = (observed / eligible) if eligible > 0 else np.nan
-        
+
         rows_ret.append((k, int(eligible), int(observed), ret * 100 if pd.notna(ret) else np.nan))
 
     ret_table = pd.DataFrame(rows_ret, columns=["mes_vida", "eligible_clients", "observed_active_clients", "retencion_%"])
@@ -210,7 +191,7 @@ def compute_historico(df: pd.DataFrame, col_fecha: str, col_id: str, col_monto: 
     }
 
 # ============================================================
-# 4. Generación de Tablas y Reportes
+# 4. Generación de Reportes HTML (ACTUALIZADO CON YOM)
 # ============================================================
 def tabla_por_mesvida(ids_base, rango_teorico, cm_arpu):
     seg_arpu = cm_arpu[cm_arpu["id"].isin(ids_base) & cm_arpu["mes_vida"].isin(rango_teorico)].copy()
@@ -238,79 +219,144 @@ def _b64_png_from_matplotlib(fig) -> str:
     return base64.b64encode(buf.read()).decode("utf-8")
 
 def _retencion_chart_png(ret_table: pd.DataFrame) -> str:
+    if ret_table is None or ret_table.empty: return ""
     x = np.asarray(ret_table["mes_vida"].values)
     y = np.asarray(ret_table["retencion_%"].values)
-    fig = plt.figure()
+    fig = plt.figure(figsize=(10, 5))
     ax = fig.add_subplot(111)
-    ax.plot(x, y)
-    ax.set_title("Retención %")
+    ax.plot(x, y, marker='o', color='#4C1D95', linewidth=2)
+    ax.set_title("Curva de Retención (%)", fontsize=14)
     ax.set_xlabel("Mes de vida")
     ax.set_ylabel("Retención (%)")
     ax.grid(True, alpha=0.3)
+    for i, txt in enumerate(y):
+        if pd.notna(txt):
+            ax.annotate(f"{txt:.1f}%", (x[i], y[i]), textcoords="offset points", xytext=(0,10), ha='center')
+    encoded = _b64_png_from_matplotlib(fig)
     plt.close(fig)
-    return _b64_png_from_matplotlib(fig)
+    return encoded
 
-def _df_html(df: pd.DataFrame, max_rows: int = 300) -> str:
-    df2 = df.copy()
-    if len(df2) > max_rows: df2 = df2.head(max_rows)
-    return df2.to_html(border=0, float_format=lambda x: '{:,.0f}'.format(x))
+def build_full_report_html(ids_nuevos_len, ids_recurrentes_len, outlier_customers_len, 
+                           limite_outlier, avg_new_entries, avg_rec_active, 
+                           t_new, t_rec, ret_table,
+                           df_yom_new=None, df_yom_rec=None, yom_impacto_total=None):
+    
+    def format_val(x):
+        if isinstance(x, (int, float)):
+            if pd.isna(x): return "-"
+            return f"{x:,.0f}".replace(",", ".")
+        return x
+    
+    chart_b64 = _retencion_chart_png(ret_table)
+    img_tag = f'<img src="data:image/png;base64,{chart_b64}" style="width:100%; max-width:800px; margin: 20px auto; display:block;" />' if chart_b64 else "<p>Sin datos</p>"
 
-def build_full_report_html(*, ids_nuevos_len, ids_recurrentes_len, outlier_customers_len,
-                           limite_outlier, avg_new_entries, avg_rec_active,
-                           t_new, t_rec, ret_table, yom_res, yom_bd) -> str:
-    ret_png_b64 = _retencion_chart_png(ret_table)
-    yom_html = "<p><i>No hay resultados YOM.</i></p>"
-    if yom_res is not None:
-        comp = yom_res.get("comparativa", pd.DataFrame()).copy()
-        if not comp.empty:
-            if "Cartera Activa" in comp.columns:
-                comp["Cartera Activa"] = comp["Cartera Activa"].map(lambda x: f"{float(x):,.2f}")
-            if "Ingreso Mensual" in comp.columns:
-                comp["Ingreso Mensual"] = comp["Ingreso Mensual"].map(lambda x: f"${float(x):,.0f}")
-            comp_html = comp.to_html(index=False, border=0)
-        else: comp_html = ""
+    html_new = t_new.applymap(format_val).to_html(classes='styled-table') if not t_new.empty else "<p>Sin datos</p>"
+    html_rec = t_rec.applymap(format_val).to_html(classes='styled-table') if not t_rec.empty else "<p>Sin datos</p>"
+    html_ret = ret_table.applymap(format_val).to_html(classes='styled-table', index=False) if not ret_table.empty else "<p>Sin datos</p>"
 
-        yom_html = f"""
-        <h2>🧮 Simulador YOM</h2>
-        <ul>
-          <li><b>Impacto Total Anual:</b> {fmt_money(yom_res.get("impacto_total_anual"))}</li>
-          <li><b>Ingreso adicional (Nuevos):</b> {fmt_money(yom_res.get("ingreso_mensual_adic_nuevos"))}</li>
-          <li><b>Ingreso adicional (Actuales):</b> {fmt_money(yom_res.get("ingreso_mensual_adic_actuales"))}</li>
-        </ul>
-        <h3>Comparativa</h3>
-        {comp_html}
-        """
+    # Renderizado de tablas YOM
+    html_yom_n = df_yom_new.to_html(classes='styled-table', index=False) if df_yom_new is not None else "<p>Sin simulación activa</p>"
+    html_yom_r = df_yom_rec.to_html(classes='styled-table', index=False) if df_yom_rec is not None else "<p>Sin simulación activa</p>"
+    str_impacto = yom_impacto_total if yom_impacto_total else "$0"
 
-    html = f"""
-    <html>
+    style = """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; color: #1F2937; padding: 40px; background-color: #F3F4F6; margin: 0; }
+    .container { max-width: 1000px; margin: auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }
+    h1 { color: #4C1D95; border-bottom: 3px solid #7C3AED; padding-bottom: 10px; margin-bottom: 30px; }
+    h2 { color: #6D28D9; margin-top: 40px; border-left: 5px solid #7C3AED; padding-left: 15px; font-size: 1.5rem; }
+    h3 { color: #4C1D95; margin-top: 25px; }
+    
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+    .kpi-card { background: #F5F3FF; padding: 20px; border-radius: 8px; border: 1px solid #DDD6FE; text-align: center; }
+    .kpi-label { color: #6D28D9; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
+    .kpi-value { font-size: 1.8rem; font-weight: 800; color: #111827; }
+    .kpi-sub { font-size: 0.8rem; color: #6B7280; margin-top: 5px; }
+
+    .styled-table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 0.9em; box-shadow: 0 0 20px rgba(0, 0, 0, 0.05); }
+    .styled-table thead tr { background-color: #4C1D95; color: #ffffff; text-align: center; }
+    .styled-table th, .styled-table td { padding: 12px 15px; border: 1px solid #E5E7EB; }
+    .styled-table tbody tr { border-bottom: 1px solid #dddddd; }
+    .styled-table tbody tr:nth-of-type(even) { background-color: #F9FAFB; }
+    .styled-table td { text-align: right; }
+    .styled-table td:first-child { text-align: left; font-weight: 600; color: #374151; }
+    
+    .impact-box { background-color: #F0FDF4; border: 1px solid #BBF7D0; padding: 25px; border-radius: 12px; text-align: center; margin: 30px 0; }
+    .impact-title { color: #15803D; font-weight: 700; text-transform: uppercase; font-size: 0.9rem; margin-bottom: 5px; }
+    .impact-value { color: #14532D; font-size: 2.8rem; font-weight: 800; }
+    .impact-sub { color: #166534; font-size: 0.9rem; opacity: 0.8; }
+
+    .footer { margin-top: 60px; font-size: 0.85rem; color: #9CA3AF; text-align: center; border-top: 1px solid #E5E7EB; padding-top: 20px; }
+    </style>
+    """
+
+    html_template = f"""
+    <!DOCTYPE html>
+    <html lang="es">
     <head>
-      <meta charset="utf-8"/>
-      <title>Reporte Flux Analytics</title>
-      <style>
-        body {{ font-family: sans-serif; padding: 24px; }}
-        h1, h2, h3 {{ margin: 10px 0; }}
-        .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
-        .card {{ border: 1px solid #ddd; padding: 12px; }}
-        table {{ border-collapse: collapse; width: 100%; }}
-        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: right; }}
-        th {{ background: #f3f3f3; }}
-        img {{ max-width: 100%; }}
-      </style>
+        <meta charset="UTF-8">
+        <title>Reporte Flux Analytics</title>
+        {style}
     </head>
     <body>
-      <h1>📊 Reporte Flux Analytics</h1>
-      <div class="grid">
-        <div class="card"><b>Base Nuevos</b><div>{ids_nuevos_len:,}</div></div>
-        <div class="card"><b>Base Recurrentes</b><div>{ids_recurrentes_len:,}</div></div>
-        <div class="card"><b>Outliers</b><div>{outlier_customers_len:,}</div></div>
-        <div class="card"><b>Umbral</b><div>{fmt_money(limite_outlier)}</div></div>
-      </div>
-      <h2>🚀 NUEVOS</h2> {_df_html(t_new)}
-      <h2>💎 RECURRENTES</h2> {_df_html(t_rec)}
-      <h2>📈 RETENCIÓN</h2> {_df_html(ret_table)}
-      <img src="data:image/png;base64,{ret_png_b64}" />
-      {yom_html}
+    <div class="container">
+        <div style="text-align:right; color:#9CA3AF; font-size:0.8rem;">{datetime.now().strftime('%d/%m/%Y %H:%M')}</div>
+        <h1>Flux Analytics | Informe Ejecutivo</h1>
+        
+        <div class="kpi-grid">
+            <div class="kpi-card">
+                <div class="kpi-label">Clientes Nuevos</div>
+                <div class="kpi-value">{format_val(ids_nuevos_len)}</div>
+                <div class="kpi-sub">Total Histórico (0-11 m)</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Clientes Recurrentes</div>
+                <div class="kpi-value">{format_val(ids_recurrentes_len)}</div>
+                <div class="kpi-sub">Total Histórico (12-36 m)</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Entrada Mensual</div>
+                <div class="kpi-value">{format_val(avg_new_entries)}</div>
+                <div class="kpi-sub">Promedio Nuevos/Mes</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Base Activa</div>
+                <div class="kpi-value">{format_val(avg_rec_active)}</div>
+                <div class="kpi-sub">Únicos en últimos 6 meses</div>
+            </div>
+        </div>
+
+        <h2>🚀 Análisis de Nuevos</h2>
+        <p>Comportamiento de clientes captados en el último año.</p>
+        {html_new}
+
+        <h2>💎 Análisis de Recurrentes</h2>
+        <p>Desempeño de la base fidelizada (antigüedad > 12 meses).</p>
+        {html_rec}
+
+        <h2>📈 Retención</h2>
+        {img_tag}
+        {html_ret}
+
+        <h2>🔮 Simulación de Impacto YOM</h2>
+        <div class="impact-box">
+            <div class="impact-title">Impacto Total Mensual Proyectado</div>
+            <div class="impact-value">{str_impacto}</div>
+            <div class="impact-sub">Suma de eficiencia operativa y gestión comercial YOM</div>
+        </div>
+
+        <h3>A. Impacto en Nuevos Clientes (Adquisición & Recuperación)</h3>
+        {html_yom_n}
+
+        <h3>B. Impacto en Clientes Recurrentes (Cartera Actual)</h3>
+        {html_yom_r}
+
+        <div class="footer">
+            Reporte generado por Flux Analytics Powered by YOM. Propiedad de Frederick Russell Krauss.
+        </div>
+    </div>
     </body>
     </html>
     """
-    return html
+    return html_template
